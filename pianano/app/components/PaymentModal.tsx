@@ -16,29 +16,63 @@ interface PaymentModalProps {
   onClose: () => void;
 }
 
-const TEST_NANO_ADDRESS = 'nano_3uct7fjjxg87ccg3n6dtx51hk7ekjkz79ihd7pdsasp6qzo9pim6fcy1jh66';
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+
+// Format Nano amount to exactly 0.1 instead of 0.099999...
+const formatNanoAmount = (rawAmount: string): string => {
+  // Convert to number and divide by 10^30 (Nano raw conversion)
+  const nanoAmount = Number(rawAmount) / 1e30;
+  // Format to fixed 1 decimal place
+  return nanoAmount.toFixed(1);
+};
 
 const PaymentModal = ({ song, onClose }: PaymentModalProps) => {
   const [paymentReceived, setPaymentReceived] = useState(false);
-  const nanoPaymentUrl = `nano:${TEST_NANO_ADDRESS}?amount=${song.price_raw}`;
+  const [isMonitoring, setIsMonitoring] = useState(false);
+  const nanoPaymentUrl = `nano:${song.nano_address}?amount=${song.price_raw}`;
+
+  // Start monitoring when modal opens
+  useEffect(() => {
+    const startMonitoring = async () => {
+      try {
+        // Reset payment status and start monitoring
+        await axios.post(`${API_URL}/start-monitoring/${song.nano_address}`);
+        setIsMonitoring(true);
+      } catch (error) {
+        console.error('Error starting monitoring:', error);
+      }
+    };
+
+    startMonitoring();
+
+    // Clean up when modal closes
+    return () => {
+      // Stop monitoring when component unmounts
+      axios.post(`${API_URL}/stop-monitoring/${song.nano_address}`)
+        .catch(error => console.error('Error stopping monitoring:', error));
+    };
+  }, [song.nano_address]);
 
   // Poll for payment status
   useEffect(() => {
+    if (!isMonitoring) return;
+
     const checkPayment = async () => {
       try {
-        const response = await axios.get(`http://localhost:3000/payment-status/${TEST_NANO_ADDRESS}`);
+        const response = await axios.get(`${API_URL}/payment-status/${song.nano_address}`);
         if (response.data.paid) {
           setPaymentReceived(true);
-          setTimeout(onClose, 3000); // Close modal after 3 seconds
+          setIsMonitoring(false); // Stop checking once payment is received
+          setTimeout(onClose, 2000); // Changed from 3000 to 2000
         }
       } catch (error) {
         console.error('Error checking payment:', error);
       }
     };
 
-    const interval = setInterval(checkPayment, 5000); // Check every 5 seconds
+    const interval = setInterval(checkPayment, 5000);
     return () => clearInterval(interval);
-  }, [onClose]);
+  }, [onClose, song.nano_address, isMonitoring]);
 
   return (
     <div className="fixed inset-0 bg-black/70 flex justify-center items-center z-50">
@@ -61,10 +95,10 @@ const PaymentModal = ({ song, onClose }: PaymentModalProps) => {
               />
             </div>
             <p className="text-sm text-gray-700 mb-2">
-              Send {Number(song.price_raw) / 1e30} Nano to:
+              Send {formatNanoAmount(song.price_raw)} Nano to:
             </p>
             <p className="bg-gray-100 p-2 rounded font-mono text-sm break-all text-gray-900">
-              {TEST_NANO_ADDRESS}
+              {song.nano_address}
             </p>
           </>
         )}

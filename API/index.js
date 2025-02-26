@@ -8,20 +8,42 @@ const multer = require('multer');
 const upload = multer();
 const app = express();
 
-// Add the TEST_NANO_ADDRESS constant
-const TEST_NANO_ADDRESS = 'nano_3uct7fjjxg87ccg3n6dtx51hk7ekjkz79ihd7pdsasp6qzo9pim6fcy1jh66';
-
 // Add SerialPort setup with better error handling and logging
 let serialPort = null;
-const ARDUINO_PORT = '/dev/cu.usbmodem1301';
+const ARDUINO_PORT = '/dev/tty.usbmodem11301';
 
-// Function to initialize serial port
-function initializeSerialPort() {
-    console.log('Attempting to connect to Arduino on port:', ARDUINO_PORT);
+// Function to find and connect to Arduino port
+async function findAndConnectArduino() {
+    console.log('Searching for Arduino ports...');
+    
+    try {
+        const ports = await SerialPort.SerialPort.list();
+        console.log('Available ports:', ports);
+        
+        // Find the Arduino port (looking for both usbmodem and Arduino in manufacturer)
+        const arduinoPort = ports.find(port => 
+            port.path.toLowerCase().includes('usbmodem') || 
+            (port.manufacturer && port.manufacturer.toLowerCase().includes('arduino'))
+        );
+        
+        if (arduinoPort) {
+            console.log('Found Arduino port:', arduinoPort.path);
+            initializeSerialPort(arduinoPort.path);
+        } else {
+            console.error('No Arduino port found');
+        }
+    } catch (err) {
+        console.error('Error listing serial ports:', err);
+    }
+}
+
+// Update the initializeSerialPort function to accept a port parameter
+function initializeSerialPort(port = ARDUINO_PORT) {
+    console.log('Attempting to connect to Arduino on port:', port);
     
     try {
         serialPort = new SerialPort.SerialPort({
-            path: ARDUINO_PORT,
+            path: port,
             baudRate: 9600,
             autoOpen: false // Don't open automatically
         });
@@ -99,14 +121,14 @@ function triggerSolenoid() {
     });
 }
 
-// Initialize serial port on startup
-initializeSerialPort();
+// Call findAndConnectArduino instead of initializeSerialPort on startup
+findAndConnectArduino();
 
-// Add reconnection logic
+// Update the reconnection logic
 setInterval(() => {
     if (!serialPort || !serialPort.isOpen) {
         console.log('Serial port disconnected, attempting to reconnect...');
-        initializeSerialPort();
+        findAndConnectArduino();
     }
 }, 5000);
 
@@ -116,54 +138,59 @@ app.use((req, res, next) => {
     next();
 });
 
-// CORS configuration
+// Configure CORS
 const corsOptions = {
-    origin: process.env.NODE_ENV === 'production' 
-        ? 'https://your-frontend-domain.com'
-        : 'http://localhost:3001',
+    origin: [
+        'http://localhost:3001',
+        'https://pianano.vercel.app', // Add your Vercel domain here
+        /\.vercel\.app$/ // This allows all Vercel subdomains
+    ],
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type'],
-    credentials: true
+    credentials: true,
+    optionsSuccessStatus: 200
 };
 
-// Initialize database connection
+// Initialize monitored addresses Map
+const monitoredAddresses = new Map();
+
+// Update the database initialization to set up monitoring
 const db = new sqlite3.Database('./music.db', (err) => {
     if (err) {
         console.error('Error connecting to database:', err);
     } else {
         console.log('Connected to SQLite database');
-        initializeDatabase();
+        // Initialize monitoring for all song addresses
+        db.all('SELECT nano_address FROM songs', [], (err, rows) => {
+            if (err) {
+                console.error('Error fetching addresses:', err);
+                return;
+            }
+            
+            console.log('Initializing address monitoring...');
+            rows.forEach(row => {
+                monitoredAddresses.set(row.nano_address, false);
+                // Subscribe to each address if WebSocket is ready
+                if (ws.readyState === ws.OPEN) {
+                    const subscription = {
+                        action: "subscribe",
+                        topic: "confirmation",
+                        options: {
+                            accounts: [row.nano_address]
+                        }
+                    };
+                    console.log('Subscribing to address:', row.nano_address);
+                    ws.send(JSON.stringify(subscription));
+                }
+            });
+            console.log('Monitoring addresses:', Array.from(monitoredAddresses.keys()));
+        });
     }
 });
-
-// Initialize database tables if they don't exist
-function initializeDatabase() {
-    // Fixed SQL syntax by removing comment and using proper default value
-    db.run(`CREATE TABLE IF NOT EXISTS songs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        midi_data BLOB,
-        nano_address TEXT UNIQUE,
-        price_raw TEXT DEFAULT '100000000000000000000000000000'
-    )`, (err) => {
-        if (err) {
-            console.error('Error creating table:', err);
-        } else {
-            console.log('Database table initialized successfully');
-        }
-    });
-}
 
 // Configure Express middleware
 app.use(express.json());
 app.use(cors(corsOptions));
 app.use(express.urlencoded({ extended: true }));
-
-// Initialize WebSocket monitoring system
-const monitoredAddresses = new Map();
-
-// Add the test address to monitoring on startup
-monitoredAddresses.set(TEST_NANO_ADDRESS, false);
 
 // Create a reconnecting WebSocket to the public node
 const ws = new ReconnectingWebSocket('wss://node.somenano.com/websocket', [], {
@@ -176,32 +203,93 @@ const ws = new ReconnectingWebSocket('wss://node.somenano.com/websocket', [], {
 });
 
 // WebSocket message handling
-ws.onmessage = msg => {
+ws.onmessage = (message) => {
     try {
-        const data = JSON.parse(msg.data);
-        console.log('WebSocket message received:', data);
+        const data = JSON.parse(message.data);
         
-        if (data.topic === "confirmation") {
+        if (data.topic === 'confirmation') {
             const block = data.message;
-            console.log('Block received:', block);
             
-            if (block.block && block.block.link_as_account === TEST_NANO_ADDRESS) {
-                console.log('Payment received for monitored address:', block.block.link_as_account);
-                console.log('Amount received:', block.amount);
+            // The sending account
+            const senderAccount = block.account;
+            
+            // For 'send' operations, the recipient is in the link_as_account field
+            const recipientAccount = block.block?.link_as_account;
+            
+            const amount = block.amount;
+            
+            console.log(`🔔 Transaction detected from ${senderAccount}`);
+            console.log(`   Amount: ${amount} raw`);
+            
+            if (recipientAccount && monitoredAddresses.has(recipientAccount)) {
+                console.log(`✅ Payment received to monitored address: ${recipientAccount}`);
+                monitoredAddresses.set(recipientAccount, true);
                 
-                // Trigger the solenoid with retry logic
-                console.log('Triggering solenoid for payment...');
-                triggerSolenoid();
+                // Record the payment in the database
+                db.run('INSERT INTO payments (nano_address, amount) VALUES (?, ?)', 
+                    [recipientAccount, amount], 
+                    function(err) {
+                        if (err) {
+                            console.error('Error recording payment:', err);
+                        } else {
+                            console.log('Payment recorded with ID:', this.lastID);
+                        }
+                    }
+                );
                 
-                // Update payment status in memory
-                monitoredAddresses.set(TEST_NANO_ADDRESS, true);
-                console.log('Updated payment status for address:', TEST_NANO_ADDRESS);
+                // Find the song associated with this address
+                db.get('SELECT midi_data FROM songs WHERE nano_address = ?', [recipientAccount], (err, row) => {
+                    if (err) {
+                        console.error('Error finding song:', err);
+                        return;
+                    }
+                    
+                    if (row) {
+                        console.log('Found song, sending to Arduino');
+                        sendSongToArduino(row.midi_data);
+                    } else {
+                        console.error('No song found for address:', recipientAccount);
+                    }
+                });
             }
         }
     } catch (error) {
         console.error('Error processing WebSocket message:', error);
     }
 };
+
+// Function to send song data to Arduino
+function sendSongToArduino(midiData) {
+    if (!serialPort || !serialPort.isOpen) {
+        console.error('Serial port not available, cannot send song');
+        return;
+    }
+
+    console.log('========================');
+    console.log('🎹 SENDING SONG TO ARDUINO');
+    console.log('Song data:', midiData);
+    console.log('========================');
+    
+    // Add newline character to ensure Arduino receives complete command
+    const dataToSend = midiData + '\n';
+    
+    // Write data with explicit encoding
+    serialPort.write(dataToSend, 'utf8', (err) => {
+        if (err) {
+            console.error('❌ ERROR writing to serial port:', err.message);
+        } else {
+            console.log('✅ Song data sent successfully to Arduino');
+            // Ensure data is flushed to the device
+            serialPort.drain((err) => {
+                if (err) {
+                    console.error('❌ ERROR draining serial port:', err.message);
+                } else {
+                    console.log('✅ Data successfully flushed to Arduino');
+                }
+            });
+        }
+    });
+}
 
 // API Endpoints
 
@@ -215,22 +303,24 @@ app.get('/songs', (req, res) => {
             return;
         }
         
-        // Ensure we're monitoring the test address
-        if (!monitoredAddresses.has(TEST_NANO_ADDRESS)) {
-            monitoredAddresses.set(TEST_NANO_ADDRESS, false);
-            // Subscribe to the address if needed
-            if (ws.readyState === ws.OPEN) {
-                const subscription = {
-                    action: "subscribe",
-                    topic: "confirmation",
-                    options: {
-                        accounts: [TEST_NANO_ADDRESS]
-                    }
-                };
-                console.log('Subscribing to test address:', TEST_NANO_ADDRESS);
-                ws.send(JSON.stringify(subscription));
+        // Add all song addresses to monitoring
+        rows.forEach(song => {
+            if (!monitoredAddresses.has(song.nano_address)) {
+                monitoredAddresses.set(song.nano_address, false);
+                // Subscribe to the address if needed
+                if (ws.readyState === ws.OPEN) {
+                    const subscription = {
+                        action: "subscribe",
+                        topic: "confirmation",
+                        options: {
+                            accounts: [song.nano_address]
+                        }
+                    };
+                    console.log('Subscribing to address:', song.nano_address);
+                    ws.send(JSON.stringify(subscription));
+                }
             }
-        }
+        });
 
         console.log(`Retrieved ${rows.length} songs`);
         console.log('Currently monitored addresses:', Array.from(monitoredAddresses.keys()));
@@ -346,20 +436,10 @@ function sendMidiToUSB(midiData) {
     console.log('MIDI data:', midiData);
 }
 
-// WebSocket connection management
+// Update WebSocket connection handler
 ws.onopen = () => {
     console.log('🟢 WebSocket connected!');
-    
-    // Subscribe to the test address immediately
-    const subscription = {
-        action: "subscribe",
-        topic: "confirmation",
-        options: {
-            accounts: [TEST_NANO_ADDRESS]
-        }
-    };
-    console.log('Subscribing to test address:', TEST_NANO_ADDRESS);
-    ws.send(JSON.stringify(subscription));
+    // We'll subscribe to addresses only when needed, not all at once
 };
 
 ws.onerror = (error) => {
@@ -370,17 +450,87 @@ ws.onclose = (event) => {
     console.log('🔴 WebSocket closed:', event);
 };
 
-// Add this endpoint to check payment status
+// Add these new endpoints to the API
+
+// Start monitoring a specific address
+app.post('/start-monitoring/:address', (req, res) => {
+    const address = req.params.address;
+    console.log('Starting monitoring for address:', address);
+    
+    // Reset payment status to false
+    monitoredAddresses.set(address, false);
+    
+    // Subscribe to the address
+    if (ws.readyState === ws.OPEN) {
+        const subscription = {
+            action: "subscribe",
+            topic: "confirmation",
+            options: {
+                accounts: [address]
+            }
+        };
+        console.log('Subscribing to address:', address);
+        ws.send(JSON.stringify(subscription));
+    }
+    
+    res.json({ success: true, message: `Started monitoring address: ${address}` });
+});
+
+// Stop monitoring a specific address
+app.post('/stop-monitoring/:address', (req, res) => {
+    const address = req.params.address;
+    console.log('Stopping monitoring for address:', address);
+    
+    // We don't actually unsubscribe from the WebSocket, just mark it as not being actively monitored
+    // This is because other users might be monitoring the same address
+    
+    res.json({ success: true, message: `Stopped active monitoring for address: ${address}` });
+});
+
+// Update the payment-status endpoint to be more accurate
 app.get('/payment-status/:address', (req, res) => {
     const address = req.params.address;
     console.log('Checking payment status for address:', address);
-    console.log('Current monitored addresses:', Array.from(monitoredAddresses.entries()));
     
     // Check if we've received payment for this address
     const hasPayment = monitoredAddresses.get(address) === true;
-    console.log('Payment status:', hasPayment);
+    console.log('Payment status for', address, ':', hasPayment);
     
     res.json({ paid: hasPayment });
+});
+
+// Add a new endpoint to get total donations
+app.get('/total-donations', (req, res) => {
+    // Query the database to count successful payments
+    db.all('SELECT COUNT(*) as count FROM payments', [], (err, rows) => {
+        if (err) {
+            console.error('Error counting payments:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        
+        const count = rows[0].count || 0;
+        // Each payment is 0.1 Nano
+        const totalNano = count * 0.1;
+        
+        res.json({ 
+            total: totalNano,
+            count: count
+        });
+    });
+});
+
+// Create a payments table if it doesn't exist
+db.run(`CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nano_address TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)`, (err) => {
+    if (err) {
+        console.error('Error creating payments table:', err);
+    } else {
+        console.log('Payments table ready');
+    }
 });
 
 // Start the server

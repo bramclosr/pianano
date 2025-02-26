@@ -5,6 +5,8 @@ import axios from 'axios';
 
 const TEST_NANO_ADDRESS = 'nano_3uct7fjjxg87ccg3n6dtx51hk7ekjkz79ihd7pdsasp6qzo9pim6fcy1jh66';
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+
 const UploadForm = () => {
   const [name, setName] = useState('');
   const [file, setFile] = useState<File | null>(null);
@@ -20,10 +22,10 @@ const UploadForm = () => {
     formData.append('name', name);
     formData.append('midi_data', file);
     formData.append('nano_address', TEST_NANO_ADDRESS);
-    formData.append('price_raw', '100000000000000000000000000000');
+    formData.append('price_raw', '10000000000000000000000000000000');
 
     try {
-      const response = await axios.post('http://localhost:3000/songs', formData, {
+      const response = await axios.post(`${API_URL}/songs`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
